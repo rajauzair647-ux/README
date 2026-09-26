@@ -1,0 +1,149 @@
+%%writefile test_classification.py
+
+import pytest
+from unittest.mock import patch, MagicMock
+import os
+
+# Assuming classify_email, ClassificationResult, EmailCategory are defined in the same scope
+# or can be imported from a module. For Colab, we'll assume they are defined globally for testing purposes.
+# In a real project, you'd import them from your main module.
+
+# To make the test file self-contained for execution, I'll re-include the necessary definitions.
+from pydantic import BaseModel, Field, ValidationError
+from enum import Enum
+from typing import Literal
+import openai
+import json
+
+class EmailCategory(str, Enum):
+    SALES = "Sales"
+    SUPPORT = "Support"
+    MARKETING = "Marketing"
+    BILLING = "Billing"
+
+class ClassificationResult(BaseModel):
+    category: EmailCategory | Literal["Manual Review"]
+    confidence: float = Field(..., ge=0.0, le=1.0)
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") # Will be mocked for tests
+
+def classify_email(email_content: str) -> ClassificationResult:
+    if not OPENAI_API_KEY:
+        # In tests, this will be mocked away, but keeping for completeness
+        return ClassificationResult(category="Manual Review", confidence=0.0)
+
+    client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
+    prompt = f"""
+    Classify the following email into one of these categories: {', '.join([e.value for e in EmailCategory])}.
+    Provide a confidence score between 0.0 and 1.0 for your classification.
+    If the email does not fit clearly into any of these categories, you may still choose the best fit
+    and provide a low confidence score.
+    Your response MUST be a JSON object with two fields: 'category' (string) and 'confidence' (float).
+    Example: {{"category": "Sales", "confidence": 0.95}}
+
+    Email content: '''{email_content}'''
+    """
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are an email classification assistant. Respond only with a JSON object."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.0,
+            response_format={ "type": "json_object" }
+        )
+
+        llm_output = response.choices[0].message.content
+        parsed_result = ClassificationResult.model_validate_json(llm_output)
+
+        if parsed_result.confidence < 0.7:
+            return ClassificationResult(category="Manual Review", confidence=parsed_result.confidence)
+
+        return parsed_result
+
+    except ValidationError as e:
+        print(f"Pydantic validation failed: {e}")
+        return ClassificationResult(category="Manual Review", confidence=0.0)
+    except json.JSONDecodeError as e:
+        print(f"LLM response was not valid JSON: {e}\nResponse: {llm_output}")
+        return ClassificationResult(category="Manual Review", confidence=0.0)
+    except openai.APIError as e:
+        print(f"OpenAI API error: {e}")
+        return ClassificationResult(category="Manual Review", confidence=0.0)
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        return ClassificationResult(category="Manual Review", confidence=0.0)
+
+
+
+# Mock the OPENAI_API_KEY for testing purposes to avoid actual API calls.
+# In a real test environment, this would typically be set during test setup.
+os.environ["OPENAI_API_KEY"] = "mock_api_key"
+
+@pytest.fixture
+def mock_openai_client():
+    with patch('openai.OpenAI') as mock_client:
+        yield mock_client
+
+
+def test_classify_email_sales_high_confidence(mock_openai_client):
+    mock_response_content = '{"category": "Sales", "confidence": 0.98}'
+    mock_openai_client.return_value.chat.completions.create.return_value = MagicMock(
+        choices=[MagicMock(message=MagicMock(content=mock_response_content))]
+    )
+
+    result = classify_email("I want to buy your new product, please send me a quote.")
+
+    assert result.category == EmailCategory.SALES
+    assert result.confidence == 0.98
+
+
+def test_classify_email_support_low_confidence_manual_review(mock_openai_client):
+    mock_response_content = '{"category": "Support", "confidence": 0.65}'
+    mock_openai_client.return_value.chat.completions.create.return_value = MagicMock(
+        choices=[MagicMock(message=MagicMock(content=mock_response_content))]
+    )
+
+    result = classify_email("My software is crashing, but I'm not sure if it's a bug.")
+
+    assert result.category == "Manual Review"
+    assert result.confidence == 0.65
+
+
+def test_classify_email_marketing_above_threshold(mock_openai_client):
+    mock_response_content = '{"category": "Marketing", "confidence": 0.75}'
+    mock_openai_client.return_value.chat.completions.create.return_value = MagicMock(
+        choices=[MagicMock(message=MagicMock(content=mock_response_content))]
+    )
+
+    result = classify_email("Tell me more about your upcoming promotions and new features.")
+
+    assert result.category == EmailCategory.MARKETING
+    assert result.confidence == 0.75
+
+
+def test_classify_email_invalid_json_fallback(mock_openai_client):
+    mock_response_content = 'This is not JSON data.'
+    mock_openai_client.return_value.chat.completions.create.return_value = MagicMock(
+        choices=[MagicMock(message=MagicMock(content=mock_response_content))]
+    )
+
+    result = classify_email("Please update my billing information.")
+
+    assert result.category == "Manual Review"
+    assert result.confidence == 0.0
+
+
+def test_classify_email_pydantic_validation_error_fallback(mock_openai_client):
+    mock_response_content = '{"category": "InvalidCategory", "confidence": 0.88}'
+    mock_openai_client.return_value.chat.completions.create.return_value = MagicMock(
+        choices=[MagicMock(message=MagicMock(content=mock_response_content))]
+    )
+
+    result = classify_email("I need help with my account, it's not working.")
+
+    assert result.category == "Manual Review"
+    assert result.confidence == 0.0
